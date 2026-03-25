@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gflow"
+version = "0.1.0"
+description = "A command-line interface to Google Flow (AI image & video generation)"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "click>=8.1",
+    "rich>=13.0",
+    "pydantic>=2.0",
+    "selenium>=4.15",
+    "webdriver-manager>=4.0",
+    "websocket-client>=1.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "ruff",
+]
+
+[project.scripts]
+gflow = "gflow.cli.main:cli"
+
+[tool.setuptools.packages.find]
+include = ["gflow*"]
+
+[tool.ruff]
+line-length = 120

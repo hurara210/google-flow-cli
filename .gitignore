@@ -1,0 +1,44 @@
+# ── Credentials & secrets ──────────────────────
+.env
+.env.*
+~/.gflow/
+*.cookie
+*.cookies
+
+# ── Python ────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+.venv/
+venv/
+.pytest_cache/
+
+# ── Generated media (don't commit your outputs) ─
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+output/
+
+# ── Debug / capture files ─────────────────────
+*-network-capture.json
+*.log
+
+# ── IDE / OS ──────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Misc ──────────────────────────────────────
+generate_intro.bat
+intro_script.md

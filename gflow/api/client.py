@@ -1,0 +1,1026 @@
+"""
+Google Flow API client.
+
+Reverse-engineered from network traffic captured by `gflow sniff`.
+
+Endpoints:
+  - Project creation:  labs.google/fx/api/trpc/project.createProject
+  - Image generation:  aisandbox-pa.googleapis.com/v1/projects/{pid}/flowMedia:batchGenerateImages
+  - Video generation:  aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoText
+  - Video status:      aisandbox-pa.googleapis.com/v1/video:batchCheckAsyncVideoGenerationStatus
+  - Media URLs:        labs.google/fx/api/trpc/media.getMediaUrlRedirect
+  - Session/auth:      labs.google/fx/api/auth/session
+
+Auth:
+  - labs.google requests: Cookie header
+  - aisandbox-pa requests: Bearer token only (no cookies!)
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import os
+import random
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+import requests
+
+from gflow.api.models import (
+    Asset,
+    AssetType,
+    ExtendVideoRequest,
+    GenerateImageRequest,
+    GenerateVideoRequest,
+)
+from gflow.auth.browser_auth import refresh_access_token, AuthError
+from gflow.auth.recaptcha import RecaptchaProvider, RecaptchaError
+
+logger = logging.getLogger("gflow.api")
+
+# Actual API endpoints (from network capture)
+SANDBOX_BASE = "https://aisandbox-pa.googleapis.com"
+LABS_BASE = "https://labs.google/fx/api"
+
+# Internal model names (discovered from sniff)
+IMAGE_MODEL = "NARWHAL"  # Imagen 4 internal name
+VIDEO_MODEL = "veo_3_1_t2v_fast_ultra"  # Veo 3.1 fast/ultra
+TOOL_NAME = "PINHOLE"  # Flow's internal tool name
+
+# Aspect ratio mapping
+IMAGE_ASPECT_MAP = {
+    "square": "IMAGE_ASPECT_RATIO_SQUARE",
+    "1:1": "IMAGE_ASPECT_RATIO_SQUARE",
+    "portrait": "IMAGE_ASPECT_RATIO_PORTRAIT",
+    "9:16": "IMAGE_ASPECT_RATIO_PORTRAIT",
+    "landscape": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+    "16:9": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+    "4:3": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
+}
+
+VIDEO_ASPECT_MAP = {
+    "square": "VIDEO_ASPECT_RATIO_SQUARE",
+    "1:1": "VIDEO_ASPECT_RATIO_SQUARE",
+    "portrait": "VIDEO_ASPECT_RATIO_PORTRAIT",
+    "9:16": "VIDEO_ASPECT_RATIO_PORTRAIT",
+    "landscape": "VIDEO_ASPECT_RATIO_LANDSCAPE",
+    "16:9": "VIDEO_ASPECT_RATIO_LANDSCAPE",
+}
+
+# Extend model names include the aspect ratio + quality suffix
+# Ultra plan uses _ultra suffix (matches base VIDEO_MODEL pattern)
+EXTEND_MODEL_MAP = {
+    "landscape": "veo_3_1_extend_fast_landscape_ultra",
+    "16:9": "veo_3_1_extend_fast_landscape_ultra",
+    "portrait": "veo_3_1_extend_fast_portrait_ultra",
+    "9:16": "veo_3_1_extend_fast_portrait_ultra",
+    "square": "veo_3_1_extend_fast_square_ultra",
+    "1:1": "veo_3_1_extend_fast_square_ultra",
+}
+
+
+class FlowClient:
+    """
+    Client for Google Flow's internal APIs.
+
+    Flow requires:
+    1. A project (created per session via trpc)
+    2. Bearer auth for aisandbox-pa.googleapis.com
+    3. Cookie auth for labs.google
+    """
+
+    def __init__(self, cookies: str, *, debug: bool = False):
+        self.debug = debug or os.environ.get("GFLOW_DEBUG") == "true"
+        self.cookies = cookies
+        self._access_token: str = ""
+        self._project_id: str = ""
+        self._workflow_id: str = ""
+        self._primary_media_id: str = ""  # from workflow metadata — used for extend
+        self._session_id: str = f";{int(time.time() * 1000)}"
+        # Maps operation names to media names (they differ!)
+        self._op_to_media: dict[str, str] = {}
+
+        # Separate sessions for different hosts
+        self._sandbox_session = requests.Session()
+        self._labs_session = requests.Session()
+
+        # reCAPTCHA Enterprise token provider (lazy-initialized)
+        self._recaptcha: RecaptchaProvider | None = None
+
+    # ------------------------------------------------------------------
+    # Token & Project Management
+    # ------------------------------------------------------------------
+
+    def _ensure_token(self) -> None:
+        """Ensure we have a valid access token."""
+        if not self._access_token:
+            self._refresh_token()
+
+    def _refresh_token(self) -> None:
+        """Get a fresh access token from the session endpoint."""
+        data = refresh_access_token(self.cookies, debug=self.debug)
+        self._access_token = data["access_token"]
+
+        # Update sandbox session (Bearer only, no cookies)
+        self._sandbox_session.headers.update({
+            "Authorization": f"Bearer {self._access_token}",
+            "Origin": "https://labs.google",
+            "Referer": "https://labs.google/",
+            "Content-Type": "text/plain;charset=UTF-8",
+        })
+
+        # Update labs session (cookies, no Bearer for trpc)
+        self._labs_session.headers.update({
+            "Cookie": self.cookies,
+            "Origin": "https://labs.google",
+            "Referer": "https://labs.google/fx/tools/flow",
+            "Content-Type": "application/json",
+        })
+
+        if self.debug:
+            logger.info("Token refreshed: %s...", self._access_token[:20])
+
+    def _get_recaptcha_token(self, action: str = "IMAGE_GENERATION") -> str:
+        """Get a fresh reCAPTCHA Enterprise token.
+
+        Args:
+            action: reCAPTCHA action — "IMAGE_GENERATION" or "VIDEO_GENERATION"
+        """
+        if self._recaptcha is None:
+            self._recaptcha = RecaptchaProvider(cookies=self.cookies, debug=self.debug)
+
+        try:
+            return self._recaptcha.get_token(action=action)
+        except RecaptchaError as e:
+            raise FlowAPIError(
+                f"reCAPTCHA failed: {e}\n"
+                "Make sure you're authenticated: gflow auth"
+            )
+
+    def _build_client_context(self, project_id: str, recaptcha_token: str) -> dict:
+        """Build the clientContext dict used in all generation requests."""
+        return {
+            "recaptchaContext": {
+                "token": recaptcha_token,
+                "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+            },
+            "projectId": project_id,
+            "tool": TOOL_NAME,
+            "userPaygateTier": "PAYGATE_TIER_TWO",
+            "sessionId": self._session_id,
+        }
+
+    def _ensure_project(self) -> str:
+        """Create a project if we don't have one, or return existing."""
+        if self._project_id:
+            return self._project_id
+
+        self._ensure_token()
+
+        # Create a new project via trpc
+        url = f"{LABS_BASE}/trpc/project.createProject"
+        now = time.strftime("%b %d, %I:%M %p")
+        payload = {
+            "json": {
+                "projectTitle": f"gflow {now}",
+                "toolName": TOOL_NAME,
+            }
+        }
+
+        if self.debug:
+            logger.info("Creating project: %s", json.dumps(payload))
+
+        resp = self._labs_session.post(url, json=payload, timeout=30)
+
+        if resp.status_code != 200:
+            raise FlowAPIError(f"Failed to create project: {resp.status_code} {resp.text[:300]}")
+
+        data = resp.json()
+        # Extract project ID from response
+        # Response format: {"result":{"data":{"json":{"result":{"projectId":"..."},"status":200}}}}
+        json_data = data.get("result", {}).get("data", {}).get("json", {})
+        project_id = (
+            json_data.get("result", {}).get("projectId", "")
+            or json_data.get("projectId", "")
+        )
+
+        if not project_id:
+            if self.debug:
+                logger.info("Project response: %s", json.dumps(data, indent=2)[:500])
+            raise FlowAPIError(f"Could not extract project ID from response: {json.dumps(data)[:300]}")
+
+        self._project_id = project_id
+        if self.debug:
+            logger.info("Created project: %s", project_id)
+
+        return project_id
+
+    def _ensure_workflow(self) -> str:
+        """Ensure we have a workflow ID for the current project.
+
+        Workflows are used by Flow to group related media (e.g. a video
+        and its extensions).  The extend endpoint requires a valid
+        workflowId in the request metadata.
+        """
+        if self._workflow_id:
+            return self._workflow_id
+
+        self._ensure_token()
+        project_id = self._ensure_project()
+
+        # Create a new workflow via POST to flowWorkflows
+        url = f"{SANDBOX_BASE}/v1/flowWorkflows"
+        workflow_name = str(uuid.uuid4())
+        payload = {
+            "workflow": {
+                "name": workflow_name,
+                "projectId": project_id,
+                "metadata": {
+                    "displayName": "gflow video",
+                },
+            },
+        }
+
+        if self.debug:
+            logger.info("Creating workflow: %s", json.dumps(payload))
+
+        resp = self._sandbox_request("POST", url, json_payload=payload)
+
+        if resp.status_code >= 400:
+            # If POST fails, just use the UUID we generated — the video
+            # generation response will create the workflow implicitly.
+            logger.warning("Workflow creation returned %s — using generated ID", resp.status_code)
+            self._workflow_id = workflow_name
+            return self._workflow_id
+
+        data = resp.json()
+        # Extract workflow ID from response
+        wf_id = data.get("name", "") or data.get("workflowId", "") or workflow_name
+        self._workflow_id = wf_id
+        if self.debug:
+            logger.info("Created workflow: %s", wf_id)
+
+        return self._workflow_id
+
+    def update_workflow(
+        self,
+        workflow_id: str,
+        display_name: str = "",
+        primary_media_id: str = "",
+    ) -> None:
+        """Update a workflow via PATCH /v1/flowWorkflows/{id}.
+
+        The Flow UI calls this after every video generation and after
+        each extend completes.  It updates:
+        - ``displayName`` — human-readable title (after initial generation)
+        - ``primaryMediaId`` — the ID the extend endpoint uses to locate the
+          source video (after every extend, so subsequent extends can chain)
+        """
+        self._ensure_token()
+        project_id = self._ensure_project()
+
+        url = f"{SANDBOX_BASE}/v1/flowWorkflows/{workflow_id}"
+
+        metadata: dict[str, str] = {}
+        masks: list[str] = []
+
+        if display_name:
+            metadata["displayName"] = display_name
+            masks.append("metadata.displayName")
+        if primary_media_id:
+            metadata["primaryMediaId"] = primary_media_id
+            masks.append("metadata.primaryMediaId")
+
+        if not masks:
+            return  # nothing to update
+
+        payload = {
+            "workflow": {
+                "name": workflow_id,
+                "projectId": project_id,
+                "metadata": metadata,
+            },
+            "updateMask": ",".join(masks),
+        }
+
+        if self.debug:
+            logger.info("Updating workflow %s: %s", workflow_id, json.dumps(payload))
+
+        try:
+            self._sandbox_request("PATCH", url, json_payload=payload)
+        except FlowAPIError as e:
+            logger.warning("Workflow update failed (non-fatal): %s", e)
+
+    # ------------------------------------------------------------------
+    # Image Generation
+    # ------------------------------------------------------------------
+
+    def generate_image(self, req: GenerateImageRequest) -> list[Asset]:
+        """
+        Generate images using Imagen 4 (NARWHAL).
+
+        POST /v1/projects/{pid}/flowMedia:batchGenerateImages
+        """
+        self._ensure_token()
+        project_id = self._ensure_project()
+
+        # Get a fresh reCAPTCHA token
+        recaptcha_token = self._get_recaptcha_token()
+
+        url = f"{SANDBOX_BASE}/v1/projects/{project_id}/flowMedia:batchGenerateImages"
+
+        aspect = IMAGE_ASPECT_MAP.get(req.aspect_ratio.lower(), "IMAGE_ASPECT_RATIO_LANDSCAPE")
+        seed = req.seed if req.seed is not None else random.randint(10000, 99999)
+        batch_id = str(uuid.uuid4())
+
+        # Build the client context with reCAPTCHA
+        client_ctx = self._build_client_context(project_id, recaptcha_token)
+
+        # Build request payload matching exact Flow format
+        payload = {
+            "clientContext": client_ctx,
+            "mediaGenerationContext": {"batchId": batch_id},
+            "useNewMedia": True,
+            "requests": [],
+        }
+
+        # One request per image
+        for i in range(req.num_images):
+            img_req = {
+                "clientContext": client_ctx,
+                "imageModelName": IMAGE_MODEL,
+                "imageAspectRatio": aspect,
+                "structuredPrompt": {
+                    "parts": [{"text": req.prompt}],
+                },
+                "seed": seed + i,
+                "imageInputs": [],
+            }
+            payload["requests"].append(img_req)
+
+        if self.debug:
+            safe = json.dumps(payload, indent=2)[:1000]
+            logger.info("Image request to %s:\n%s", url, safe)
+
+        resp = self._sandbox_request("POST", url, json_payload=payload)
+        data = resp.json()
+
+        if self.debug:
+            safe = json.dumps(data, indent=2)[:1000]
+            logger.info("Image response:\n%s", safe)
+
+        return self._parse_image_response(data, req.prompt)
+
+    # ------------------------------------------------------------------
+    # Video Generation (async)
+    # ------------------------------------------------------------------
+
+    def generate_video(self, req: GenerateVideoRequest) -> list[Asset]:
+        """
+        Generate a video using Veo 3.1 (async).
+
+        POST /v1/video:batchAsyncGenerateVideoText
+        """
+        self._ensure_token()
+        project_id = self._ensure_project()
+
+        # Get a fresh reCAPTCHA token (video uses VIDEO_GENERATION action)
+        recaptcha_token = self._get_recaptcha_token(action="VIDEO_GENERATION")
+
+        url = f"{SANDBOX_BASE}/v1/video:batchAsyncGenerateVideoText"
+
+        aspect = VIDEO_ASPECT_MAP.get(req.aspect_ratio.lower(), "VIDEO_ASPECT_RATIO_LANDSCAPE")
+        seed = req.seed if req.seed is not None else random.randint(10000, 99999)
+        batch_id = str(uuid.uuid4())
+
+        client_ctx = self._build_client_context(project_id, recaptcha_token)
+
+        payload = {
+            "mediaGenerationContext": {"batchId": batch_id},
+            "clientContext": client_ctx,
+            "requests": [{
+                "aspectRatio": aspect,
+                "seed": seed,
+                "textInput": {
+                    "structuredPrompt": {
+                        "parts": [{"text": req.prompt}],
+                    },
+                },
+                "videoModelKey": VIDEO_MODEL,
+                "metadata": {},
+            }],
+            "useV2ModelConfig": True,
+        }
+
+        if self.debug:
+            safe = json.dumps(payload, indent=2)[:1000]
+            logger.info("Video request to %s:\n%s", url, safe)
+
+        resp = self._sandbox_request("POST", url, json_payload=payload)
+        data = resp.json()
+
+        if self.debug:
+            safe = json.dumps(data, indent=2)[:2000]
+            logger.info("Video response:\n%s", safe)
+
+        # Store workflow ID and primaryMediaId from response (needed for extend)
+        workflows = data.get("workflows", [])
+        if workflows and isinstance(workflows, list):
+            wf = workflows[0]
+            wf_id = wf.get("name", "") or wf.get("id", "") or wf.get("workflowId", "")
+            if wf_id:
+                self._workflow_id = wf_id
+                logger.info("Stored workflow ID from video response: %s", wf_id)
+
+            # primaryMediaId is the ID the extend endpoint uses to find the source video.
+            # This is NOT the same as media[].name or operations[].operation.name.
+            primary = wf.get("metadata", {}).get("primaryMediaId", "")
+            if primary:
+                self._primary_media_id = primary
+                logger.info("Stored primaryMediaId from workflow: %s", primary)
+
+        if self.debug:
+            ops = data.get("operations", [])
+            medias = data.get("media", [])
+            op_id = ops[0].get("operation", {}).get("name", "") if ops else "NONE"
+            media_id = medias[0].get("name", "") if medias else "NONE"
+            logger.info("Video IDs — operation: %s, media: %s, primaryMedia: %s",
+                        op_id, media_id, self._primary_media_id)
+
+        return self._parse_video_response(data, req.prompt, batch_id)
+
+    # ------------------------------------------------------------------
+    # Video Extend (async)
+    # ------------------------------------------------------------------
+
+    def extend_video(self, req: ExtendVideoRequest) -> list[Asset]:
+        """
+        Extend a video using Veo 3.1 extend.
+
+        POST /v1/video:batchAsyncGenerateVideoExtendVideo
+
+        Takes an existing video's media ID and generates a continuation
+        based on the extend prompt.  Requires a valid workflowId in
+        metadata — obtained from the base video generation response or
+        created explicitly.
+        """
+        self._ensure_token()
+        project_id = self._ensure_project()
+
+        # Resolve workflow ID — priority: explicit > stored > create new
+        workflow_id = req.workflow_id or self._workflow_id
+        if not workflow_id:
+            workflow_id = self._ensure_workflow()
+
+        # Extend uses VIDEO_GENERATION reCAPTCHA action (same as video generation)
+        recaptcha_token = self._get_recaptcha_token(action="VIDEO_GENERATION")
+
+        url = f"{SANDBOX_BASE}/v1/video:batchAsyncGenerateVideoExtendVideo"
+
+        aspect = VIDEO_ASPECT_MAP.get(req.aspect_ratio.lower(), "VIDEO_ASPECT_RATIO_LANDSCAPE")
+        extend_model = EXTEND_MODEL_MAP.get(req.aspect_ratio.lower(), "veo_3_1_extend_fast_landscape")
+        seed = req.seed if req.seed is not None else random.randint(10000, 99999)
+        batch_id = str(uuid.uuid4())
+
+        client_ctx = self._build_client_context(project_id, recaptcha_token)
+
+        payload = {
+            "mediaGenerationContext": {"batchId": batch_id},
+            "clientContext": client_ctx,
+            "requests": [{
+                "aspectRatio": aspect,
+                "seed": seed,
+                "textInput": {
+                    "structuredPrompt": {
+                        "parts": [{"text": req.prompt}],
+                    },
+                },
+                "videoModelKey": extend_model,
+                "metadata": {
+                    "workflowId": workflow_id,
+                },
+                "videoInput": {
+                    "mediaId": req.media_id,
+                },
+            }],
+            "useV2ModelConfig": True,
+        }
+
+        if self.debug:
+            safe = json.dumps(payload, indent=2)[:1000]
+            logger.info("Extend request to %s:\n%s", url, safe)
+
+        resp = self._sandbox_request("POST", url, json_payload=payload)
+        data = resp.json()
+
+        if self.debug:
+            safe = json.dumps(data, indent=2)[:1000]
+            logger.info("Extend response:\n%s", safe)
+
+        return self._parse_video_response(data, req.prompt, batch_id)
+
+    def check_video_status(self, operation_names: list[str]) -> dict:
+        """
+        Check status of async video generation.
+
+        POST /v1/video:batchCheckAsyncVideoGenerationStatus
+
+        Real payload format (from network sniff):
+          {"media": [{"name": "uuid", "projectId": "uuid"}]}
+        """
+        self._ensure_token()
+
+        url = f"{SANDBOX_BASE}/v1/video:batchCheckAsyncVideoGenerationStatus"
+
+        # Build the real payload format — each media item needs name + projectId
+        media_items = []
+        for op_name in operation_names:
+            media_items.append({
+                "name": op_name,
+                "projectId": self._project_id,
+            })
+
+        payload = {"media": media_items}
+
+        if self.debug:
+            logger.info("Video status check payload: %s", json.dumps(payload))
+
+        resp = self._sandbox_request("POST", url, json_payload=payload)
+        return resp.json()
+
+    def get_flow_media(self, media_name: str) -> dict:
+        """
+        Get full media details including fifeUrl for download.
+
+        GET /v1/flowMedia/{name}
+
+        The status check endpoint does NOT return fifeUrl — only this
+        endpoint does.  Call it after status shows SUCCESSFUL.
+        """
+        self._ensure_token()
+        url = f"{SANDBOX_BASE}/v1/flowMedia/{media_name}"
+
+        if self.debug:
+            logger.info("Fetching media details: %s", url)
+
+        resp = self._sandbox_request("GET", url)
+        return resp.json()
+
+    # Successful status values (Flow uses SUCCESSFUL, not COMPLETE)
+    _VIDEO_DONE_STATUSES = {
+        "MEDIA_GENERATION_STATUS_SUCCESSFUL",
+        "MEDIA_GENERATION_STATUS_COMPLETE",   # keep as fallback
+    }
+    _VIDEO_FAIL_STATUSES = {
+        "MEDIA_GENERATION_STATUS_FAILED",
+    }
+
+    def wait_for_video(self, operation_names: list[str], timeout: int = 300) -> list[Asset]:
+        """Poll video status until complete or timeout.
+
+        Flow for video:
+        1. Poll batchCheckAsyncVideoGenerationStatus until
+           mediaGenerationStatus == MEDIA_GENERATION_STATUS_SUCCESSFUL
+        2. Fetch GET /v1/flowMedia/{name} to get the fifeUrl
+        3. Return assets with download URLs
+        """
+        start = time.time()
+        poll_interval = 10  # seconds
+
+        while time.time() - start < timeout:
+            data = self.check_video_status(operation_names)
+
+            if self.debug:
+                logger.info("Video status: %s", json.dumps(data, indent=2)[:2000])
+
+            all_done = True
+            completed_names: list[str] = []
+
+            # Primary format: media[].mediaMetadata.mediaStatus.mediaGenerationStatus
+            media_list = data.get("media", [])
+            for media_item in media_list:
+                media_name = media_item.get("name", "")
+                status_info = (
+                    media_item.get("mediaMetadata", {})
+                    .get("mediaStatus", {})
+                    .get("mediaGenerationStatus", "")
+                )
+
+                if self.debug:
+                    logger.info("  Media %s status: %s", media_name[:8], status_info)
+
+                if status_info in self._VIDEO_FAIL_STATUSES:
+                    media_status = media_item.get("mediaMetadata", {}).get("mediaStatus", {})
+                    failure_reason = (
+                        media_status.get("failureReason", "")
+                        or media_status.get("errorMessage", "")
+                        or media_status.get("reason", "")
+                        or json.dumps(media_status)[:200]
+                    )
+                    raise FlowAPIError(f"Video generation failed: {failure_reason}")
+
+                if status_info in self._VIDEO_DONE_STATUSES:
+                    completed_names.append(media_name)
+                else:
+                    all_done = False
+
+            if all_done and completed_names:
+                # All done — now fetch full media details to get fifeUrl
+                assets = []
+                for name in completed_names:
+                    try:
+                        media_detail = self.get_flow_media(name)
+                        vid_data = (
+                            media_detail.get("video", {})
+                            .get("generatedVideo", {})
+                        )
+                        fife_url = vid_data.get("fifeUrl", "")
+
+                        if self.debug:
+                            logger.info("  Media %s fifeUrl: %s", name[:8],
+                                        fife_url[:80] if fife_url else "NONE")
+
+                        asset = Asset(
+                            id=name,
+                            name=f"video-{name[:8]}",
+                            asset_type=AssetType.VIDEO,
+                            url=fife_url,
+                            raw=vid_data,
+                        )
+                        assets.append(asset)
+                    except FlowAPIError as e:
+                        logger.warning("Failed to get media detail for %s: %s", name, e)
+                        # Still create an asset without URL — save_video will try redirect
+                        asset = Asset(
+                            id=name,
+                            name=f"video-{name[:8]}",
+                            asset_type=AssetType.VIDEO,
+                            raw={},
+                        )
+                        assets.append(asset)
+
+                return assets
+
+            elapsed = int(time.time() - start)
+            if self.debug:
+                logger.info("Video still rendering... (%ds / %ds)", elapsed, timeout)
+
+            time.sleep(poll_interval)
+
+        raise FlowAPIError(f"Video generation timed out after {timeout}s")
+
+    # ------------------------------------------------------------------
+    # Media URL (get download link for generated content)
+    # ------------------------------------------------------------------
+
+    def get_media_url(self, media_name: str) -> str:
+        """
+        Get a signed download URL for a media item.
+
+        GET labs.google/fx/api/trpc/media.getMediaUrlRedirect?name={uuid}
+        """
+        self._ensure_token()
+        url = f"{LABS_BASE}/trpc/media.getMediaUrlRedirect"
+        resp = self._labs_session.get(
+            url, params={"name": media_name}, timeout=30, allow_redirects=False
+        )
+
+        # This endpoint typically redirects to GCS
+        if resp.status_code in (301, 302, 307, 308):
+            return resp.headers.get("Location", "")
+
+        # Or returns JSON with the URL
+        if resp.status_code == 200:
+            data = resp.json()
+            return (
+                data.get("result", {})
+                .get("data", {})
+                .get("json", {})
+                .get("url", "")
+            ) or resp.url
+
+        raise FlowAPIError(f"Failed to get media URL: {resp.status_code}")
+
+    # ------------------------------------------------------------------
+    # Download / Save
+    # ------------------------------------------------------------------
+
+    def save_image(self, asset: Asset, output_path: str | Path) -> Path:
+        """Save a generated image to disk."""
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Try base64 data first
+        encoded = asset.raw.get("encodedImage", "")
+        if encoded:
+            img_bytes = base64.b64decode(encoded)
+            output_path.write_bytes(img_bytes)
+            return output_path
+
+        # Try fifeUrl (signed GCS URL from Flow response)
+        fife_url = asset.raw.get("fifeUrl", "") or asset.url
+        if fife_url:
+            return self.download_asset(fife_url, output_path)
+
+        # Try media URL redirect endpoint
+        media_id = asset.raw.get("mediaGenerationId", "") or asset.id
+        if media_id:
+            try:
+                url = self.get_media_url(media_id)
+                if url:
+                    return self.download_asset(url, output_path)
+            except FlowAPIError:
+                pass
+
+        raise FlowAPIError(f"Asset {asset.id} has no downloadable content")
+
+    def save_video(self, asset: Asset, output_path: str | Path) -> Path:
+        """Save a generated video to disk."""
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Try fifeUrl (signed GCS URL from Flow response)
+        fife_url = asset.raw.get("fifeUrl", "") or asset.url
+        if fife_url:
+            return self.download_asset(fife_url, output_path)
+
+        # Try media URL redirect endpoint
+        media_id = asset.raw.get("mediaGenerationId", "") or asset.id
+        if media_id:
+            try:
+                url = self.get_media_url(media_id)
+                if url:
+                    return self.download_asset(url, output_path)
+            except FlowAPIError:
+                pass
+
+        raise FlowAPIError(f"Video asset {asset.id} has no downloadable content")
+
+    def download_asset(self, url: str, output_path: str | Path) -> Path:
+        """Download content from a URL."""
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        resp = requests.get(url, stream=True, timeout=120)
+        resp.raise_for_status()
+
+        with open(output_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        return output_path
+
+    # ------------------------------------------------------------------
+    # Account Info
+    # ------------------------------------------------------------------
+
+    def get_user_info(self) -> dict:
+        """Get current user info."""
+        data = refresh_access_token(self.cookies, debug=self.debug)
+        return data.get("user", {})
+
+    # ------------------------------------------------------------------
+    # Raw request (for discovery)
+    # ------------------------------------------------------------------
+
+    def raw_request(self, method: str, path: str, payload: dict | None = None) -> Any:
+        """Make a raw API request for endpoint discovery."""
+        self._ensure_token()
+
+        if path.startswith("http"):
+            url = path
+        elif path.startswith("/"):
+            url = f"{SANDBOX_BASE}{path}"
+        else:
+            url = f"{SANDBOX_BASE}/{path}"
+
+        if "labs.google" in url:
+            resp = self._labs_session.request(method, url, json=payload, timeout=30)
+        else:
+            resp = self._sandbox_request(method, url, json_payload=payload)
+
+        return resp.json()
+
+    # ------------------------------------------------------------------
+    # Internal HTTP helpers
+    # ------------------------------------------------------------------
+
+    def _sandbox_request(self, method: str, url: str, json_payload: dict | None = None) -> requests.Response:
+        """Make an authenticated request to aisandbox-pa.googleapis.com."""
+        if self.debug:
+            logger.info("%s %s", method, url)
+
+        # aisandbox-pa uses text/plain;charset=UTF-8 with JSON body
+        kwargs: dict[str, Any] = {"timeout": 120}
+        if json_payload is not None:
+            kwargs["data"] = json.dumps(json_payload)
+
+        resp = self._sandbox_session.request(method, url, **kwargs)
+
+        if resp.status_code == 401:
+            if self.debug:
+                logger.info("Got 401, refreshing token...")
+            self._refresh_token()
+            resp = self._sandbox_session.request(method, url, **kwargs)
+
+        if resp.status_code == 401:
+            raise FlowAPIError("Auth expired. Run: gflow auth --clear\nthen: gflow auth")
+        if resp.status_code == 403:
+            raise FlowAPIError(
+                f"Permission denied (403): {resp.text[:500]}"
+            )
+        if resp.status_code >= 400:
+            raise FlowAPIError(f"API error {resp.status_code}: {resp.text[:500]}")
+
+        return resp
+
+    # ------------------------------------------------------------------
+    # Response Parsers
+    # ------------------------------------------------------------------
+
+    def _parse_image_response(self, data: dict, prompt: str) -> list[Asset]:
+        """Parse flowMedia:batchGenerateImages response.
+
+        Real response format:
+        {
+          "media": [{
+            "name": "uuid",
+            "image": {
+              "generatedImage": {
+                "seed": 12345,
+                "mediaGenerationId": "...",
+                "prompt": "...",
+                "modelNameType": "NARWHAL",
+                "fifeUrl": "https://storage.googleapis.com/...",
+                ...
+              }
+            }
+          }]
+        }
+        """
+        assets = []
+
+        # Primary format: media[].image.generatedImage (real Flow response)
+        for i, media_item in enumerate(data.get("media", [])):
+            media_name = media_item.get("name", f"img-{i}")
+            img_data = media_item.get("image", {}).get("generatedImage", {})
+            if img_data:
+                url = img_data.get("fifeUrl", "")
+                asset = Asset(
+                    id=img_data.get("mediaGenerationId", media_name),
+                    name=media_name,
+                    asset_type=AssetType.IMAGE,
+                    url=url,
+                    prompt=img_data.get("prompt", prompt),
+                    model=img_data.get("modelNameType", IMAGE_MODEL),
+                    raw=img_data,
+                )
+                assets.append(asset)
+
+        # Fallback: responses[].generatedImages[] (older format)
+        if not assets:
+            for resp_item in data.get("responses", data.get("imagePanels", [])):
+                images = resp_item.get("generatedImages", resp_item.get("images", []))
+                for i, img in enumerate(images):
+                    asset = Asset(
+                        id=img.get("mediaGenerationId", img.get("name", f"img-{i}")),
+                        name=f"image-{i}",
+                        asset_type=AssetType.IMAGE,
+                        prompt=img.get("prompt", prompt),
+                        model=img.get("modelNameType", IMAGE_MODEL),
+                        raw=img,
+                    )
+                    assets.append(asset)
+
+        # Fallback: flat generatedImages[]
+        if not assets:
+            for i, img in enumerate(data.get("generatedImages", [])):
+                asset = Asset(
+                    id=img.get("mediaGenerationId", f"img-{i}"),
+                    name=f"image-{i}",
+                    asset_type=AssetType.IMAGE,
+                    prompt=prompt,
+                    model=IMAGE_MODEL,
+                    raw=img,
+                )
+                assets.append(asset)
+
+        if not assets and "error" in data:
+            raise FlowAPIError(f"Image generation failed: {data['error']}")
+
+        return assets
+
+    def _parse_video_response(self, data: dict, prompt: str, batch_id: str = "") -> list[Asset]:
+        """Parse batchAsyncGenerateVideoText response.
+
+        Real response format:
+        {
+          "operations": [{
+            "operation": {"name": "uuid"},
+            "sceneId": "",
+            "status": "MEDIA_GENERATION_STATUS_PENDING"
+          }],
+          "media": [{"name": "uuid", ...}],
+          "workflows": [...]
+        }
+        """
+        assets = []
+
+        # Extract workflow ID and primaryMediaId from response (for extend continuity)
+        workflow_id = ""
+        workflows = data.get("workflows", [])
+        if workflows and isinstance(workflows, list):
+            wf = workflows[0]
+            workflow_id = wf.get("id", "") or wf.get("workflowId", "")
+            # Update primaryMediaId for chaining extends
+            primary = wf.get("metadata", {}).get("primaryMediaId", "")
+            if primary:
+                self._primary_media_id = primary
+
+        # Extract media names from media[] array (these are the actual resource IDs
+        # needed for extend, as opposed to operation names which are for status polling)
+        media_names = []
+        for m in data.get("media", []):
+            mname = m.get("name", "")
+            if mname:
+                media_names.append(mname)
+
+        for i, op in enumerate(data.get("operations", [])):
+            # Real format: operations[].operation.name
+            op_inner = op.get("operation", {})
+            op_name = op_inner.get("name", "") or op.get("name", op.get("operationName", ""))
+            status = op.get("status", "")
+
+            if op_name:
+                raw = dict(op)
+                if workflow_id:
+                    raw["_workflow_id"] = workflow_id
+
+                # The status-check endpoint needs the MEDIA name, not the
+                # operation name.  For base video generation both are the same
+                # UUID, but for extend they differ (operation is a hex hash,
+                # media is a UUID).  Always prefer the media name as the
+                # canonical ID used for polling and subsequent operations.
+                asset_id = op_name  # fallback
+                if i < len(media_names):
+                    raw["_media_name"] = media_names[i]
+                    self._op_to_media[op_name] = media_names[i]
+                    asset_id = media_names[i]
+
+                asset = Asset(
+                    id=asset_id,
+                    name=f"video-{asset_id[:8]}",
+                    asset_type=AssetType.VIDEO,
+                    prompt=prompt,
+                    raw=raw,
+                )
+                assets.append(asset)
+
+        if not assets and "error" in data:
+            raise FlowAPIError(f"Video generation failed: {data['error']}")
+
+        return assets
+
+    def get_media_name_for_op(self, op_name: str) -> str:
+        """Look up the actual media resource name for an operation name.
+
+        The video generation response has both operations[] and media[] arrays
+        with different UUIDs. Operations are for status polling; media names
+        are the actual resource IDs needed for extend/download.
+        """
+        return self._op_to_media.get(op_name, op_name)
+
+    def get_primary_media_id(self) -> str:
+        """Return the primaryMediaId from the last workflow response.
+
+        This is the ID the extend endpoint uses to locate the source video.
+        It comes from workflows[].metadata.primaryMediaId in generation
+        and extend responses, and is distinct from both the operation name
+        and the media[].name.
+        """
+        return self._primary_media_id
+
+
+    def close(self) -> None:
+        """Clean up resources (headless browser, etc.)."""
+        if getattr(self, '_recaptcha', None):
+            self._recaptcha.close()
+            self._recaptcha = None
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+class FlowAPIError(Exception):
+    """Raised when a Flow API operation fails."""
+    pass
