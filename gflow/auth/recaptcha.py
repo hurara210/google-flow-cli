@@ -73,16 +73,19 @@ class RecaptchaProvider:
         return self._execute_recaptcha(action)
 
     def _connect(self) -> None:
-        """Connect to the existing auth Chrome browser via CDP."""
+        """Connect to the existing auth Chrome browser via CDP, launching one if needed."""
         from gflow.auth.browser_auth import get_saved_cdp_port
 
         port = get_saved_cdp_port()
         if not port:
-            raise RecaptchaError(
-                "No Chrome browser session found.\n"
-                "Run 'gflow auth' first — it opens a Chrome window that stays\n"
-                "open for reCAPTCHA. Don't close it until you're done generating."
-            )
+            logger.info("No Chrome session found — auto-launching auth browser...")
+            port = self._auto_launch_chrome()
+            if not port:
+                raise RecaptchaError(
+                    "No Chrome browser session found and auto-launch failed.\n"
+                    "Run 'gflow auth' first — it opens a Chrome window that stays\n"
+                    "open for reCAPTCHA. Don't close it until you're done generating."
+                )
 
         if self.debug:
             logger.info("Connecting to auth Chrome on port %d...", port)
@@ -110,6 +113,70 @@ class RecaptchaProvider:
 
         if self.debug:
             logger.info("Connected to auth Chrome, reCAPTCHA ready")
+
+    def _auto_launch_chrome(self) -> int | None:
+        """Auto-launch Chrome with CDP for reCAPTCHA, reusing saved cookies."""
+        import os
+        import platform
+        import subprocess
+        from gflow.auth.browser_auth import (
+            _get_chrome_path, _find_free_port, save_cdp_port,
+            _wait_for_cdp_page, ENV_DIR,
+        )
+
+        try:
+            chrome_path = _get_chrome_path()
+        except Exception:
+            return None
+
+        cdp_port = _find_free_port()
+        profile_dir = str(ENV_DIR / "chrome-profile")
+
+        args = [
+            chrome_path,
+            f"--remote-debugging-port={cdp_port}",
+            "--remote-allow-origins=*",
+            f"--user-data-dir={profile_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            FLOW_URL,
+        ]
+
+        if self.debug:
+            logger.info("Auto-launching Chrome on CDP port %d", cdp_port)
+
+        creation_flags = 0
+        if platform.system() == "Windows":
+            creation_flags = (
+                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            )
+
+        try:
+            subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creation_flags if platform.system() == "Windows" else 0,
+                start_new_session=(platform.system() != "Windows"),
+            )
+        except Exception as e:
+            logger.warning("Failed to launch Chrome: %s", e)
+            return None
+
+        # Wait for CDP to become available
+        try:
+            _wait_for_cdp_page(cdp_port, timeout=30)
+        except Exception:
+            logger.warning("Chrome launched but CDP not available")
+            return None
+
+        save_cdp_port(cdp_port)
+
+        # Give the page time to fully load reCAPTCHA scripts
+        import time as _time
+        _time.sleep(5)
+
+        return cdp_port
 
     def _find_flow_tab(self, port: int) -> str | None:
         """Find a tab that's already on labs.google/fx."""

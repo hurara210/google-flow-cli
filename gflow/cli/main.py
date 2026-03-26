@@ -33,11 +33,17 @@ logger = logging.getLogger("gflow")
 
 
 def _get_client(debug: bool = False) -> FlowClient:
-    """Create an authenticated FlowClient."""
+    """Create an authenticated FlowClient, auto-launching auth if needed."""
     auth = load_env()
     if not auth or not auth.is_valid:
-        console.print("[red]Not authenticated. Run 'gflow auth' first.[/red]")
-        sys.exit(1)
+        console.print("[yellow]Not authenticated — launching browser login...[/yellow]")
+        browser_auth = BrowserAuth(debug=debug)
+        try:
+            auth = browser_auth.get_auth(interactive=True)
+            save_env(auth)
+        except AuthError as e:
+            console.print(f"[red]Authentication failed:[/red] {e}")
+            sys.exit(1)
 
     return FlowClient(
         cookies=auth.cookies,
