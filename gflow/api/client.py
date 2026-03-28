@@ -468,96 +468,101 @@ class FlowClient:
     def _create_project_via_cdp(self, payload: dict) -> dict | None:
         """Create a project by running fetch() inside the Chrome browser via CDP.
 
-        This bypasses datacenter IP blocks since the request comes from
-        Chrome's browser context with full fingerprint/cookies.
+        Key requirements for this to work:
+        1. The Chrome tab MUST be on labs.google — the browser enforces Origin
+           based on the current page, and custom Origin headers in fetch() are
+           silently ignored. If the tab is on chrome://newtab, the Origin will
+           be wrong and Google rejects with 401.
+        2. Don't set custom Origin/Referer headers — let the browser set them
+           from the page context (that's the whole point of using CDP).
+        3. Check for error responses properly (trpc returns {"error":{...}} dicts).
         """
         try:
-            from gflow.auth.browser_auth import get_saved_cdp_port
-            import websocket
-
-            port = get_saved_cdp_port()
-            if not port:
-                logger.warning("No CDP port available for browser-based project creation")
+            ws, port = self._get_cdp_websocket()
+            if not ws:
+                logger.warning("No CDP WebSocket available for project creation")
                 return None
 
-            # Find a Flow tab
-            tab_url = f"http://127.0.0.1:{port}/json/list"
-            resp = urllib.request.urlopen(tab_url, timeout=5)
-            targets = json.loads(resp.read().decode())
+            # CRITICAL: Ensure the tab is on labs.google/fx
+            # Browser sets Origin from the current page — if the tab navigated
+            # away (login redirect, error, etc.), the Origin will be wrong and
+            # Google returns 401. Navigate there first.
+            current_url = self._cdp_evaluate(ws, "window.location.href", timeout=5)
+            if not current_url or "labs.google/fx" not in str(current_url):
+                logger.info("CDP tab not on Flow page (url=%s), navigating...", current_url)
+                # Navigate to Flow — this sets the correct Origin for fetch()
+                nav_js = """
+                    new Promise((resolve) => {
+                        window.location.href = 'https://labs.google/fx/tools/flow';
+                        // Wait for navigation to complete
+                        setTimeout(() => resolve('navigated'), 5000);
+                    })
+                """
+                self._cdp_evaluate(ws, nav_js, timeout=15)
+                # Re-verify we're on the right page
+                time.sleep(3)
+                current_url = self._cdp_evaluate(ws, "window.location.href", timeout=5)
+                if not current_url or "labs.google" not in str(current_url):
+                    logger.warning("CDP: could not navigate to Flow page (url=%s)", current_url)
+                    ws.close()
+                    return None
+                logger.info("CDP tab now on: %s", current_url)
 
-            ws_url = None
-            for target in targets:
-                if target.get("type") == "page":
-                    page_url = target.get("url", "")
-                    if "labs.google" in page_url:
-                        ws_url = target.get("webSocketDebuggerUrl", "")
-                        break
+            # Build the fetch call — NO custom Origin/Referer headers!
+            # The browser sets these automatically from the page context.
+            payload_json = json.dumps(payload)
+            # Escape for embedding in JS template literal
+            payload_escaped = payload_json.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
 
-            if not ws_url:
-                # Use any page tab
-                for target in targets:
-                    if target.get("type") == "page":
-                        ws_url = target.get("webSocketDebuggerUrl", "")
-                        break
-
-            if not ws_url:
-                logger.warning("No usable Chrome tab found for CDP project creation")
-                return None
-
-            ws = websocket.create_connection(ws_url, timeout=30)
-
-            # Execute fetch() inside Chrome
-            payload_json = json.dumps(payload).replace("'", "\\'").replace('"', '\\"')
             js_code = f"""
                 fetch('https://labs.google/fx/api/trpc/project.createProject', {{
                     method: 'POST',
                     headers: {{
-                        'Content-Type': 'application/json',
-                        'Origin': 'https://labs.google',
-                        'Referer': 'https://labs.google/fx/tools/flow'
+                        'Content-Type': 'application/json'
                     }},
-                    credentials: 'include',
-                    body: "{payload_json}"
+                    credentials: 'same-origin',
+                    body: `{payload_escaped}`
                 }})
-                .then(r => r.json())
-                .then(data => JSON.stringify(data))
-                .catch(e => JSON.stringify({{error: e.message}}))
+                .then(async r => {{
+                    const text = await r.text();
+                    return JSON.stringify({{status: r.status, body: text}});
+                }})
+                .catch(e => JSON.stringify({{status: 0, body: '', error: e.message}}))
             """
 
-            msg_id = 1
-            ws.send(json.dumps({
-                "id": msg_id,
-                "method": "Runtime.evaluate",
-                "params": {
-                    "expression": js_code,
-                    "awaitPromise": True,
-                    "returnByValue": True,
-                }
-            }))
-
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                try:
-                    ws.settimeout(5)
-                    raw = ws.recv()
-                    data = json.loads(raw)
-                    if data.get("id") == msg_id:
-                        result = data.get("result", {}).get("result", {})
-                        value = result.get("value", "")
-                        ws.close()
-                        if value and isinstance(value, str):
-                            parsed = json.loads(value)
-                            if "error" in parsed and isinstance(parsed["error"], str):
-                                logger.warning("CDP fetch error: %s", parsed["error"])
-                                return None
-                            logger.info("Project created via Chrome CDP successfully")
-                            return parsed
-                        return None
-                except Exception:
-                    continue
-
+            value = self._cdp_evaluate(ws, js_code, timeout=30)
             ws.close()
-            return None
+
+            if not value or not isinstance(value, str):
+                logger.warning("CDP project creation: no response")
+                return None
+
+            try:
+                wrapper = json.loads(value)
+            except json.JSONDecodeError:
+                logger.warning("CDP project creation: invalid JSON response")
+                return None
+
+            status = wrapper.get("status", 0)
+            body_str = wrapper.get("body", "")
+            error = wrapper.get("error", "")
+
+            if error:
+                logger.warning("CDP fetch error: %s", error)
+                return None
+
+            if status != 200:
+                logger.warning("CDP project creation returned HTTP %d: %s", status, body_str[:300])
+                return None
+
+            # Parse the actual response body
+            try:
+                parsed = json.loads(body_str)
+                logger.info("Project created via Chrome CDP successfully")
+                return parsed
+            except json.JSONDecodeError:
+                logger.warning("CDP project creation: response body not JSON: %s", body_str[:200])
+                return None
 
         except Exception as e:
             logger.warning("CDP project creation failed: %s", e)
@@ -1221,11 +1226,13 @@ class FlowClient:
 
         This ensures the token is bound to Chrome's proxy exit IP, not Python's.
         Critical on VPS/proxy setups where the two IPs differ.
+
+        Requires: tab must be on labs.google (call _ensure_cdp_on_flow_page first).
         """
         js_code = """
             fetch('https://labs.google/fx/api/auth/session', {
                 method: 'GET',
-                credentials: 'include'
+                credentials: 'same-origin'
             })
             .then(r => r.json())
             .then(data => JSON.stringify(data))
@@ -1252,13 +1259,46 @@ class FlowClient:
         except json.JSONDecodeError:
             return None
 
+    def _ensure_cdp_on_flow_page(self, ws) -> bool:
+        """Ensure the CDP tab is on labs.google/fx so fetch() has correct Origin.
+
+        Browsers silently ignore custom Origin headers in fetch() — the Origin
+        is always set from the current page. If the tab isn't on labs.google,
+        same-origin requests to labs.google will fail and cross-origin requests
+        to aisandbox-pa won't have the right Origin/Referer.
+
+        Returns True if the tab is (or was navigated to) the Flow page.
+        """
+        current_url = self._cdp_evaluate(ws, "window.location.href", timeout=5)
+        if current_url and "labs.google" in str(current_url):
+            return True
+
+        logger.info("CDP tab not on Flow page (url=%s), navigating...", current_url)
+        nav_js = """
+            new Promise((resolve) => {
+                window.location.href = 'https://labs.google/fx/tools/flow';
+                setTimeout(() => resolve('navigated'), 5000);
+            })
+        """
+        self._cdp_evaluate(ws, nav_js, timeout=15)
+        time.sleep(3)
+
+        current_url = self._cdp_evaluate(ws, "window.location.href", timeout=5)
+        if current_url and "labs.google" in str(current_url):
+            logger.info("CDP tab now on: %s", current_url)
+            return True
+
+        logger.warning("CDP: could not navigate to Flow page (url=%s)", current_url)
+        return False
+
     def _request_via_cdp(self, method: str, url: str, json_payload: dict | None = None) -> dict | None:
         """Execute an API request entirely through Chrome's browser context via CDP.
 
-        Two-step process:
-        1. Get a fresh access token from the session endpoint INSIDE Chrome
+        Three-step process:
+        1. Ensure the tab is on labs.google/fx (so Origin is correct)
+        2. Get a fresh access token from the session endpoint INSIDE Chrome
            (so the token is bound to Chrome's proxy exit IP)
-        2. Make the actual API request INSIDE Chrome with that token
+        3. Make the actual API request INSIDE Chrome with that token
 
         This ensures complete IP consistency: auth, token, and API request
         all go through Chrome's proxy extension → same exit IP.
@@ -1270,7 +1310,12 @@ class FlowClient:
             if not ws:
                 return None
 
-            # Step 1: Get a fresh access token from WITHIN Chrome
+            # Step 1: Ensure we're on the Flow page (correct Origin for fetch)
+            if not self._ensure_cdp_on_flow_page(ws):
+                ws.close()
+                return None
+
+            # Step 2: Get a fresh access token from WITHIN Chrome
             # (bound to Chrome's proxy IP, not Python's)
             cdp_token = self._get_token_via_cdp(ws)
             if not cdp_token:
@@ -1280,27 +1325,28 @@ class FlowClient:
 
             logger.info("CDP: got fresh access token bound to Chrome's IP")
 
-            # Step 2: Make the actual API request with Chrome-obtained token
+            # Step 3: Make the actual API request with Chrome-obtained token
             body_str = json.dumps(json_payload) if json_payload else ""
-            # Escape for JS string embedding
-            body_escaped = body_str.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+            body_escaped = body_str.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
 
             headers_obj = {
                 "Content-Type": "text/plain;charset=UTF-8",
                 "Authorization": f"Bearer {cdp_token}",
             }
-            headers_json = json.dumps(headers_obj).replace("'", "\\'")
+            headers_json = json.dumps(headers_obj)
 
             js_code = f"""
                 fetch('{url}', {{
                     method: '{method}',
                     headers: {headers_json},
-                    body: '{body_escaped}',
+                    body: `{body_escaped}`,
                     credentials: 'include'
                 }})
-                .then(r => r.text())
-                .then(text => text)
-                .catch(e => JSON.stringify({{error: e.message}}))
+                .then(async r => {{
+                    const text = await r.text();
+                    return JSON.stringify({{status: r.status, body: text}});
+                }})
+                .catch(e => JSON.stringify({{status: 0, body: '', error: e.message}}))
             """
 
             value = self._cdp_evaluate(ws, js_code, timeout=60)
@@ -1310,13 +1356,27 @@ class FlowClient:
                 return None
 
             try:
-                parsed = json.loads(value)
-                if isinstance(parsed, dict) and "error" in parsed:
-                    logger.warning("CDP fetch error: %s", parsed["error"])
-                    return None
-                return parsed
+                wrapper = json.loads(value)
             except json.JSONDecodeError:
-                logger.warning("CDP response not JSON: %s", value[:200])
+                logger.warning("CDP response not JSON: %s", str(value)[:200])
+                return None
+
+            status = wrapper.get("status", 0)
+            body_str = wrapper.get("body", "")
+            error = wrapper.get("error", "")
+
+            if error:
+                logger.warning("CDP fetch error: %s", error)
+                return None
+
+            if status != 200:
+                logger.warning("CDP sandbox request returned HTTP %d: %s", status, body_str[:300])
+                return None
+
+            try:
+                return json.loads(body_str)
+            except json.JSONDecodeError:
+                logger.warning("CDP response body not JSON: %s", body_str[:200])
                 return None
 
         except Exception as e:
