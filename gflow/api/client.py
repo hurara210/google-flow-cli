@@ -1153,55 +1153,141 @@ class FlowClient:
     # Internal HTTP helpers
     # ------------------------------------------------------------------
 
-    def _request_via_cdp(self, method: str, url: str, json_payload: dict | None = None) -> dict | None:
-        """Execute an API request through Chrome's browser context via CDP.
+    def _cdp_evaluate(self, ws, expression: str, timeout: int = 60) -> str | None:
+        """Evaluate a JS expression inside Chrome via an open CDP WebSocket.
 
-        This routes the request through Chrome's proxy extension, ensuring
-        the same exit IP that was used during authentication. This is critical
-        on VPS/proxy setups where Python's requests library may exit through
-        a different IP than Chrome, causing Google to reject the request.
+        Returns the string value, or None on failure.
+        """
+        msg_id = int(time.time() * 1000) % 1_000_000  # Unique-ish ID
+        ws.send(json.dumps({
+            "id": msg_id,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": expression,
+                "awaitPromise": True,
+                "returnByValue": True,
+            }
+        }))
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                ws.settimeout(10)
+                raw = ws.recv()
+                data = json.loads(raw)
+                if data.get("id") == msg_id:
+                    result = data.get("result", {}).get("result", {})
+                    return result.get("value")
+            except Exception:
+                continue
+        return None
+
+    def _get_cdp_websocket(self):
+        """Get a CDP WebSocket connection to a usable Chrome tab.
+
+        Returns (websocket, port) tuple, or (None, None) if unavailable.
+        """
+        from gflow.auth.browser_auth import get_saved_cdp_port
+        import websocket
+
+        port = get_saved_cdp_port()
+        if not port:
+            return None, None
+
+        tab_url = f"http://127.0.0.1:{port}/json/list"
+        resp = urllib.request.urlopen(tab_url, timeout=5)
+        targets = json.loads(resp.read().decode())
+
+        ws_url = None
+        # Prefer a tab on labs.google
+        for target in targets:
+            if target.get("type") == "page" and "labs.google" in target.get("url", ""):
+                ws_url = target.get("webSocketDebuggerUrl", "")
+                break
+        # Fall back to any page tab
+        if not ws_url:
+            for target in targets:
+                if target.get("type") == "page":
+                    ws_url = target.get("webSocketDebuggerUrl", "")
+                    break
+        if not ws_url:
+            return None, None
+
+        ws = websocket.create_connection(ws_url, timeout=60)
+        return ws, port
+
+    def _get_token_via_cdp(self, ws) -> str | None:
+        """Get a fresh access token by calling the session endpoint FROM WITHIN Chrome.
+
+        This ensures the token is bound to Chrome's proxy exit IP, not Python's.
+        Critical on VPS/proxy setups where the two IPs differ.
+        """
+        js_code = """
+            fetch('https://labs.google/fx/api/auth/session', {
+                method: 'GET',
+                credentials: 'include'
+            })
+            .then(r => r.json())
+            .then(data => JSON.stringify(data))
+            .catch(e => JSON.stringify({error: e.message}))
+        """
+
+        value = self._cdp_evaluate(ws, js_code, timeout=30)
+        if not value or not isinstance(value, str):
+            return None
+
+        try:
+            data = json.loads(value)
+            if "error" in data and isinstance(data["error"], str):
+                logger.warning("CDP session endpoint error: %s", data["error"])
+                return None
+            token = data.get("access_token", "")
+            if token:
+                if self.debug:
+                    user = data.get("user", {})
+                    logger.info("Got access token via CDP: %s... (user: %s)",
+                                token[:20], user.get("email", "?"))
+                return token
+            return None
+        except json.JSONDecodeError:
+            return None
+
+    def _request_via_cdp(self, method: str, url: str, json_payload: dict | None = None) -> dict | None:
+        """Execute an API request entirely through Chrome's browser context via CDP.
+
+        Two-step process:
+        1. Get a fresh access token from the session endpoint INSIDE Chrome
+           (so the token is bound to Chrome's proxy exit IP)
+        2. Make the actual API request INSIDE Chrome with that token
+
+        This ensures complete IP consistency: auth, token, and API request
+        all go through Chrome's proxy extension → same exit IP.
 
         Returns parsed JSON response, or None if CDP is unavailable.
         """
         try:
-            from gflow.auth.browser_auth import get_saved_cdp_port
-            import websocket
-
-            port = get_saved_cdp_port()
-            if not port:
+            ws, port = self._get_cdp_websocket()
+            if not ws:
                 return None
 
-            # Find a usable page tab
-            tab_url = f"http://127.0.0.1:{port}/json/list"
-            resp = urllib.request.urlopen(tab_url, timeout=5)
-            targets = json.loads(resp.read().decode())
-
-            ws_url = None
-            for target in targets:
-                if target.get("type") == "page":
-                    page_url = target.get("url", "")
-                    if "labs.google" in page_url:
-                        ws_url = target.get("webSocketDebuggerUrl", "")
-                        break
-            if not ws_url:
-                for target in targets:
-                    if target.get("type") == "page":
-                        ws_url = target.get("webSocketDebuggerUrl", "")
-                        break
-            if not ws_url:
+            # Step 1: Get a fresh access token from WITHIN Chrome
+            # (bound to Chrome's proxy IP, not Python's)
+            cdp_token = self._get_token_via_cdp(ws)
+            if not cdp_token:
+                logger.warning("CDP: could not get access token from session endpoint")
+                ws.close()
                 return None
 
-            ws = websocket.create_connection(ws_url, timeout=60)
+            logger.info("CDP: got fresh access token bound to Chrome's IP")
 
-            # Build the fetch() call — runs inside Chrome with full
-            # proxy, cookies, and browser fingerprint
+            # Step 2: Make the actual API request with Chrome-obtained token
             body_str = json.dumps(json_payload) if json_payload else ""
             # Escape for JS string embedding
             body_escaped = body_str.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
 
             headers_obj = {
                 "Content-Type": "text/plain;charset=UTF-8",
-                "Authorization": f"Bearer {self._access_token}",
+                "Authorization": f"Bearer {cdp_token}",
             }
             headers_json = json.dumps(headers_obj).replace("'", "\\'")
 
@@ -1217,43 +1303,21 @@ class FlowClient:
                 .catch(e => JSON.stringify({{error: e.message}}))
             """
 
-            msg_id = 1
-            ws.send(json.dumps({
-                "id": msg_id,
-                "method": "Runtime.evaluate",
-                "params": {
-                    "expression": js_code,
-                    "awaitPromise": True,
-                    "returnByValue": True,
-                }
-            }))
-
-            deadline = time.time() + 60
-            while time.time() < deadline:
-                try:
-                    ws.settimeout(10)
-                    raw = ws.recv()
-                    data = json.loads(raw)
-                    if data.get("id") == msg_id:
-                        result = data.get("result", {}).get("result", {})
-                        value = result.get("value", "")
-                        ws.close()
-                        if value and isinstance(value, str):
-                            try:
-                                parsed = json.loads(value)
-                                if isinstance(parsed, dict) and "error" in parsed:
-                                    logger.warning("CDP fetch error: %s", parsed["error"])
-                                    return None
-                                return parsed
-                            except json.JSONDecodeError:
-                                logger.warning("CDP response not JSON: %s", value[:200])
-                                return None
-                        return None
-                except Exception:
-                    continue
-
+            value = self._cdp_evaluate(ws, js_code, timeout=60)
             ws.close()
-            return None
+
+            if not value or not isinstance(value, str):
+                return None
+
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, dict) and "error" in parsed:
+                    logger.warning("CDP fetch error: %s", parsed["error"])
+                    return None
+                return parsed
+            except json.JSONDecodeError:
+                logger.warning("CDP response not JSON: %s", value[:200])
+                return None
 
         except Exception as e:
             logger.warning("CDP request failed: %s", e)
