@@ -1153,8 +1153,118 @@ class FlowClient:
     # Internal HTTP helpers
     # ------------------------------------------------------------------
 
+    def _request_via_cdp(self, method: str, url: str, json_payload: dict | None = None) -> dict | None:
+        """Execute an API request through Chrome's browser context via CDP.
+
+        This routes the request through Chrome's proxy extension, ensuring
+        the same exit IP that was used during authentication. This is critical
+        on VPS/proxy setups where Python's requests library may exit through
+        a different IP than Chrome, causing Google to reject the request.
+
+        Returns parsed JSON response, or None if CDP is unavailable.
+        """
+        try:
+            from gflow.auth.browser_auth import get_saved_cdp_port
+            import websocket
+
+            port = get_saved_cdp_port()
+            if not port:
+                return None
+
+            # Find a usable page tab
+            tab_url = f"http://127.0.0.1:{port}/json/list"
+            resp = urllib.request.urlopen(tab_url, timeout=5)
+            targets = json.loads(resp.read().decode())
+
+            ws_url = None
+            for target in targets:
+                if target.get("type") == "page":
+                    page_url = target.get("url", "")
+                    if "labs.google" in page_url:
+                        ws_url = target.get("webSocketDebuggerUrl", "")
+                        break
+            if not ws_url:
+                for target in targets:
+                    if target.get("type") == "page":
+                        ws_url = target.get("webSocketDebuggerUrl", "")
+                        break
+            if not ws_url:
+                return None
+
+            ws = websocket.create_connection(ws_url, timeout=60)
+
+            # Build the fetch() call — runs inside Chrome with full
+            # proxy, cookies, and browser fingerprint
+            body_str = json.dumps(json_payload) if json_payload else ""
+            # Escape for JS string embedding
+            body_escaped = body_str.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+
+            headers_obj = {
+                "Content-Type": "text/plain;charset=UTF-8",
+                "Authorization": f"Bearer {self._access_token}",
+            }
+            headers_json = json.dumps(headers_obj).replace("'", "\\'")
+
+            js_code = f"""
+                fetch('{url}', {{
+                    method: '{method}',
+                    headers: {headers_json},
+                    body: '{body_escaped}',
+                    credentials: 'include'
+                }})
+                .then(r => r.text())
+                .then(text => text)
+                .catch(e => JSON.stringify({{error: e.message}}))
+            """
+
+            msg_id = 1
+            ws.send(json.dumps({
+                "id": msg_id,
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": js_code,
+                    "awaitPromise": True,
+                    "returnByValue": True,
+                }
+            }))
+
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                try:
+                    ws.settimeout(10)
+                    raw = ws.recv()
+                    data = json.loads(raw)
+                    if data.get("id") == msg_id:
+                        result = data.get("result", {}).get("result", {})
+                        value = result.get("value", "")
+                        ws.close()
+                        if value and isinstance(value, str):
+                            try:
+                                parsed = json.loads(value)
+                                if isinstance(parsed, dict) and "error" in parsed:
+                                    logger.warning("CDP fetch error: %s", parsed["error"])
+                                    return None
+                                return parsed
+                            except json.JSONDecodeError:
+                                logger.warning("CDP response not JSON: %s", value[:200])
+                                return None
+                        return None
+                except Exception:
+                    continue
+
+            ws.close()
+            return None
+
+        except Exception as e:
+            logger.warning("CDP request failed: %s", e)
+            return None
+
     def _sandbox_request(self, method: str, url: str, json_payload: dict | None = None) -> requests.Response:
-        """Make an authenticated request to aisandbox-pa.googleapis.com."""
+        """Make an authenticated request to aisandbox-pa.googleapis.com.
+
+        On proxy setups, falls back to Chrome CDP routing when direct HTTP
+        gets 401 (IP mismatch between Python requests and Chrome's proxy).
+        """
         import time as _time
 
         if self.debug:
@@ -1190,6 +1300,21 @@ class FlowClient:
             if self._proxies:
                 self._rotate_proxy()
             resp = self._sandbox_session.request(method, url, **kwargs)
+
+        # If still 401 and we have a proxy setup, the issue is likely IP mismatch:
+        # Python requests exits through a different proxy IP than Chrome.
+        # Route through Chrome CDP instead (same IP as auth session).
+        if resp.status_code == 401 and self._proxies:
+            logger.info("Direct HTTP still 401 with proxies — trying via Chrome CDP (same IP as auth)...")
+            cdp_result = self._request_via_cdp(method, url, json_payload)
+            if cdp_result is not None:
+                logger.info("CDP sandbox request succeeded — proxy IP mismatch confirmed")
+                # Wrap in a fake Response so callers can use .json() / .status_code
+                fake_resp = requests.Response()
+                fake_resp.status_code = 200
+                fake_resp._content = json.dumps(cdp_result).encode("utf-8")
+                fake_resp.encoding = "utf-8"
+                return fake_resp
 
         if resp.status_code == 401:
             raise FlowAPIError("Auth expired. Run: gflow auth --clear\nthen: gflow auth")
