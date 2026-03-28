@@ -424,61 +424,6 @@ def long_video(ctx, prompt, extend_prompt, extensions, aspect_ratio, seed,
     all_assets = []
     segment_paths = []
 
-    # ---- Step 1: Generate base video ----
-    console.print(f"\n[bold]Step 1/{extensions + 1}:[/bold] Generating base video...")
-
-    req = GenerateVideoRequest(
-        prompt=prompt,
-        aspect_ratio=aspect_ratio,
-        seed=seed,
-    )
-
-    try:
-        with console.status("[bold green]Submitting base video..."):
-            assets = client.generate_video(req)
-    except FlowAPIError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
-
-    if not assets:
-        console.print("[red]No video operation returned.[/red]")
-        sys.exit(1)
-
-    op_names = [a.id for a in assets if a.id]
-    try:
-        with console.status("[bold green]Rendering base video (1-3 min)..."):
-            final_assets = client.wait_for_video(op_names, timeout=timeout)
-    except FlowAPIError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
-
-    if not final_assets:
-        console.print("[red]Base video failed.[/red]")
-        sys.exit(1)
-
-    base_asset = final_assets[0]
-    all_assets.append(base_asset)
-
-    # Save base segment
-    seg_path = out_dir / f"{prefix}-seg0.mp4"
-    try:
-        path = client.save_video(base_asset, seg_path)
-        segment_paths.append(path)
-        console.print(f"  [green]Segment 0 saved:[/green] {path}")
-    except Exception as e:
-        console.print(f"  [yellow]Download failed:[/yellow] {e}")
-
-    # Use primaryMediaId from workflow (this is what extend needs to find the source video)
-    current_media_id = client.get_primary_media_id() or client.get_media_name_for_op(base_asset.id)
-    workflow_id = client._workflow_id or ""
-    console.print(f"  Media ID (primaryMedia): {current_media_id}")
-
-    # Finalize the workflow (PATCH displayName) — the Flow UI does this
-    # after every generation and it may be needed for extend to find the media
-    if workflow_id:
-        prompt_short = prompt[:30].replace('"', '')
-        client.update_workflow(workflow_id, display_name=prompt_short)
-
     # ---- Prompt sanitization for policy violations ----
     _POLICY_KEYWORDS = re.compile(
         r'\b(explosion|exploding|blood|bloody|gore|gory|weapon|weapons|gun|guns|'
@@ -543,6 +488,106 @@ def long_video(ctx, prompt, extend_prompt, extensions, aspect_ratio, seed,
         if not cleaned.lower().startswith(('cinematic', 'documentary', 'artistic', 'aerial')):
             cleaned = f"Cinematic documentary shot of {cleaned}"
         return cleaned
+
+    # ---- Step 1: Generate base video (with retry) ----
+    console.print(f"\n[bold]Step 1/{extensions + 1}:[/bold] Generating base video...")
+
+    base_asset = None
+    for base_attempt in range(3):
+        base_prompt = prompt
+
+        if base_attempt > 0:
+            wait = 10 * base_attempt
+            console.print(f"  [yellow]Base video retry {base_attempt}/2 after {wait}s...[/yellow]")
+            _time.sleep(wait)
+
+            # If previous failure looked like a policy violation, sanitize
+            if hasattr(_base_last_error, 'is_policy') and _base_last_error.is_policy:
+                base_prompt = _sanitize_prompt(prompt, base_attempt)
+                console.print(f"  [cyan]Sanitized prompt:[/cyan] {base_prompt[:80]}...")
+
+        class _BaseError:
+            is_policy = False
+            msg = ""
+        _base_last_error = _BaseError()
+
+        try:
+            req = GenerateVideoRequest(
+                prompt=base_prompt,
+                aspect_ratio=aspect_ratio,
+                seed=seed,
+            )
+
+            try:
+                with console.status("[bold green]Submitting base video..."):
+                    assets = client.generate_video(req)
+            except FlowAPIError as e:
+                err_str = str(e)
+                _base_last_error.msg = err_str
+                _base_last_error.is_policy = _is_policy_violation(err_str)
+                console.print(f"  [red]Error submitting base video:[/red] {err_str[:120]}")
+                continue
+
+            if not assets:
+                _base_last_error.msg = "No operation returned"
+                console.print(f"  [yellow]No video operation returned.[/yellow]")
+                continue
+
+            op_names = [a.id for a in assets if a.id]
+            try:
+                with console.status("[bold green]Rendering base video (1-3 min)..."):
+                    final_assets = client.wait_for_video(op_names, timeout=timeout)
+            except FlowAPIError as e:
+                err_str = str(e)
+                _base_last_error.msg = err_str
+                _base_last_error.is_policy = _is_policy_violation(err_str)
+                console.print(f"  [red]Error rendering base video:[/red] {err_str[:120]}")
+                continue
+
+            if not final_assets:
+                _base_last_error.msg = "No assets returned"
+                _base_last_error.is_policy = True
+                console.print(f"  [yellow]Base video returned no assets (possibly blocked).[/yellow]")
+                continue
+
+            base_asset = final_assets[0]
+            all_assets.append(base_asset)
+            break  # success
+
+        except (requests.exceptions.ConnectionError, ConnectionResetError, OSError) as e:
+            _base_last_error.msg = str(e)
+            console.print(f"  [red]Connection error on base video:[/red] {str(e)[:120]}")
+            continue
+
+        except Exception as e:
+            _base_last_error.msg = str(e)
+            _base_last_error.is_policy = _is_policy_violation(str(e))
+            console.print(f"  [red]Unexpected error on base video:[/red] {str(e)[:120]}")
+            continue
+
+    if base_asset is None:
+        console.print("[red bold]Base video failed after 3 attempts. Cannot continue.[/red bold]")
+        sys.exit(1)
+
+    # Save base segment
+    seg_path = out_dir / f"{prefix}-seg0.mp4"
+    try:
+        path = client.save_video(base_asset, seg_path)
+        segment_paths.append(path)
+        console.print(f"  [green]Segment 0 saved:[/green] {path}")
+    except Exception as e:
+        console.print(f"  [yellow]Download failed:[/yellow] {e}")
+
+    # Use primaryMediaId from workflow (this is what extend needs to find the source video)
+    current_media_id = client.get_primary_media_id() or client.get_media_name_for_op(base_asset.id)
+    workflow_id = client._workflow_id or ""
+    console.print(f"  Media ID (primaryMedia): {current_media_id}")
+
+    # Finalize the workflow (PATCH displayName) — the Flow UI does this
+    # after every generation and it may be needed for extend to find the media
+    if workflow_id:
+        prompt_short = prompt[:30].replace('"', '')
+        client.update_workflow(workflow_id, display_name=prompt_short)
 
     # ---- Step 2+: Extend loop ----
     MAX_SEGMENT_RETRIES = 3
