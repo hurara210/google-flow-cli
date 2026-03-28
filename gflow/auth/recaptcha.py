@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -51,10 +52,18 @@ class RecaptchaProvider:
         self._ws = None
         self._msg_id: int = 0
         self._ready = False
+        # Threading lock prevents concurrent reconnection storms
+        # (inspired by notebooklm-py's asyncio.Lock pattern)
+        self._lock = threading.Lock()
+        self._connecting = False
 
     def get_token(self, action: str = "IMAGE_GENERATION") -> str:
         """
         Get a fresh reCAPTCHA Enterprise token.
+
+        Thread-safe: concurrent callers share a single connection/reconnection
+        cycle via a lock, preventing reCAPTCHA refresh storms (inspired by
+        notebooklm-py's concurrency-safe auth refresh pattern).
 
         Args:
             action: The reCAPTCHA action string. Flow uses:
@@ -68,9 +77,22 @@ class RecaptchaProvider:
             RecaptchaError if token cannot be obtained
         """
         if not self._ready:
-            self._connect()
+            with self._lock:
+                # Double-check after acquiring lock (another thread may have connected)
+                if not self._ready:
+                    self._connect()
 
-        return self._execute_recaptcha(action)
+        try:
+            return self._execute_recaptcha(action)
+        except RecaptchaError:
+            # Token execution failed — try reconnecting once before giving up
+            # (the CDP WebSocket may have dropped)
+            with self._lock:
+                logger.info("reCAPTCHA token failed, attempting reconnect...")
+                self._ready = False
+                self._close_ws()
+                self._connect()
+            return self._execute_recaptcha(action)
 
     def _connect(self) -> None:
         """Connect to the existing auth Chrome browser via CDP, launching one if needed."""
@@ -365,6 +387,10 @@ class RecaptchaProvider:
             time.sleep(2)
 
         # ── Phase 2: Pre-execute reCAPTCHA tokens to build trust ──
+        # Adaptive backoff between warm-up tokens (inspired by notebooklm-py's
+        # rate-limit-aware retry pattern). Each successful token slightly
+        # reduces the delay; failures increase it.
+        warmup_delay = 1.5
         for i in range(3):
             try:
                 token = self._cdp_evaluate(
@@ -373,9 +399,15 @@ class RecaptchaProvider:
                 if token and isinstance(token, str) and len(token) > 100:
                     if self.debug:
                         logger.info("  Warm-up %d/%d OK (%d chars)", i + 1, 3, len(token))
-                time.sleep(1.5)
-            except Exception:
-                time.sleep(1)
+                    # Success — can reduce delay slightly for next iteration
+                    warmup_delay = max(1.0, warmup_delay * 0.8)
+                else:
+                    warmup_delay = min(5.0, warmup_delay * 1.5)
+                time.sleep(warmup_delay)
+            except Exception as e:
+                logger.warning("  Warm-up %d/%d failed: %s", i + 1, 3, e)
+                warmup_delay = min(5.0, warmup_delay * 2.0)
+                time.sleep(warmup_delay)
 
         logger.info("reCAPTCHA warm-up complete")
 
@@ -402,14 +434,18 @@ class RecaptchaProvider:
         except Exception as e:
             raise RecaptchaError(f"Failed to execute reCAPTCHA: {e}")
 
-    def close(self) -> None:
-        """Close the WebSocket connection (does NOT close Chrome)."""
+    def _close_ws(self) -> None:
+        """Close the WebSocket connection only (internal helper)."""
         if self._ws:
             try:
                 self._ws.close()
             except Exception:
                 pass
             self._ws = None
+
+    def close(self) -> None:
+        """Close the WebSocket connection (does NOT close Chrome)."""
+        self._close_ws()
         self._ready = False
 
     def __del__(self):

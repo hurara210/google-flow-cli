@@ -524,6 +524,77 @@ class BrowserAuth:
             cdp.close()
 
 
+def refresh_cookies_from_cdp() -> AuthData | None:
+    """
+    Silently re-extract cookies from the already-running Chrome CDP session.
+
+    Inspired by notebooklm-mcp-cli's approach: instead of forcing the user
+    to re-login when cookies rotate, just pull fresh cookies from the Chrome
+    instance that's already authenticated and running.
+
+    Google rotates some cookies on every request, but Chrome handles this
+    transparently. By re-reading via CDP, we get the latest values without
+    any user interaction.
+
+    Returns:
+        AuthData with fresh cookies, or None if Chrome isn't running.
+    """
+    port = get_saved_cdp_port()
+    if not port:
+        return None
+
+    try:
+        ws_url = _wait_for_cdp_page(port, timeout=5)
+    except AuthError:
+        return None
+
+    cdp = _CDPConnection(ws_url)
+    try:
+        cdp.send("Network.enable")
+        all_cookies = _get_all_cookies_cdp(cdp)
+
+        if not all_cookies:
+            return None
+
+        # Verify Google auth cookies are still present
+        cookie_names = {c["name"] for c in all_cookies}
+        has_google_auth = bool(
+            {"SID", "HSID", "SSID", "__Secure-1PSID", "SAPISID"}.intersection(cookie_names)
+        )
+
+        if not has_google_auth:
+            logger.warning("CDP cookie refresh: Chrome running but no Google auth cookies")
+            return None
+
+        cookie_str = "; ".join(f'{c["name"]}={c["value"]}' for c in all_cookies)
+
+        # Verify the cookies actually work before returning them
+        try:
+            session_data = refresh_access_token(cookie_str, debug=False)
+            if session_data.get("access_token"):
+                logger.info(
+                    "Silent CDP cookie refresh successful (%d cookies)",
+                    len(all_cookies),
+                )
+                auth = AuthData(
+                    cookies=cookie_str,
+                    token=session_data["access_token"],
+                    expires=session_data.get("expires", ""),
+                )
+                # Persist refreshed cookies so next startup uses them
+                save_env(auth)
+                return auth
+        except AuthError:
+            logger.warning("CDP cookie refresh: cookies extracted but session endpoint rejected them")
+            return None
+
+    except Exception as e:
+        logger.warning("CDP cookie refresh failed: %s", e)
+        return None
+    finally:
+        cdp.close()
+
+
 def kill_auth_browser() -> None:
     """Kill the Chrome browser that was kept alive for reCAPTCHA."""
     port = get_saved_cdp_port()

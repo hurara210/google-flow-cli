@@ -39,7 +39,7 @@ from gflow.api.models import (
     GenerateImageRequest,
     GenerateVideoRequest,
 )
-from gflow.auth.browser_auth import refresh_access_token, AuthError
+from gflow.auth.browser_auth import refresh_access_token, refresh_cookies_from_cdp, AuthError
 from gflow.auth.recaptcha import RecaptchaProvider, RecaptchaError
 
 logger = logging.getLogger("gflow.api")
@@ -226,19 +226,46 @@ class FlowClient:
     def _refresh_token(self) -> None:
         """Get a fresh access token from the session endpoint.
 
-        If the saved cookies are expired, automatically re-authenticates
-        via browser login and retries.
+        Three-tier recovery strategy (inspired by notebooklm-py and
+        notebooklm-mcp-cli):
+
+        1. Try existing cookies (fast path — works most of the time)
+        2. Silent CDP cookie refresh from running Chrome (no user interaction)
+        3. Full browser re-authentication (last resort — requires user login)
         """
+        # Tier 1: Try existing cookies
         try:
             data = refresh_access_token(self.cookies, debug=self.debug)
-        except AuthError:
-            # Cookies expired — try to re-authenticate automatically
-            logger.info("Cookies expired — re-authenticating...")
-            new_cookies = self._re_authenticate()
-            if not new_cookies:
-                raise
-            data = refresh_access_token(self.cookies, debug=self.debug)
+            self._apply_token(data)
+            return
+        except AuthError as original_err:
+            logger.info("Tier 1 failed (existing cookies expired)")
 
+        # Tier 2: Silent CDP cookie refresh — re-extract cookies from the
+        # Chrome instance that's already running (Google rotates cookies
+        # but Chrome tracks them automatically)
+        logger.info("Trying silent CDP cookie refresh (no user interaction)...")
+        refreshed = refresh_cookies_from_cdp()
+        if refreshed and refreshed.is_valid:
+            self.cookies = refreshed.cookies
+            try:
+                data = refresh_access_token(self.cookies, debug=self.debug)
+                self._apply_token(data)
+                logger.info("Tier 2 succeeded — cookies silently refreshed from Chrome")
+                return
+            except AuthError:
+                logger.warning("Tier 2 failed — CDP cookies didn't work either")
+
+        # Tier 3: Full browser re-authentication (user interaction required)
+        logger.info("Falling back to full browser re-authentication...")
+        new_cookies = self._re_authenticate()
+        if not new_cookies:
+            raise original_err
+        data = refresh_access_token(self.cookies, debug=self.debug)
+        self._apply_token(data)
+
+    def _apply_token(self, data: dict) -> None:
+        """Apply a fresh access token and update session headers."""
         self._access_token = data["access_token"]
 
         # Update sandbox session (Bearer only, no cookies)
@@ -261,7 +288,7 @@ class FlowClient:
             logger.info("Token refreshed: %s...", self._access_token[:20])
 
     def _re_authenticate(self) -> str | None:
-        """Re-authenticate via browser and update cookies in-place."""
+        """Re-authenticate via browser and update cookies in-place (Tier 3 — last resort)."""
         try:
             from gflow.auth import BrowserAuth, save_env
             browser_auth = BrowserAuth(debug=self.debug)
@@ -306,6 +333,11 @@ class FlowClient:
     def _with_recaptcha_retry(self, fn, max_retries: int = 3):
         """Wrap a generation call with reCAPTCHA retry on 403.
 
+        Enhanced retry strategy inspired by notebooklm-py:
+        - Attempt 1: Retry with fresh reCAPTCHA token
+        - Attempt 2: Also try silent CDP cookie refresh (cookies may have rotated)
+        - Attempt 3: Full reconnect with extended warm-up
+
         Args:
             fn: A callable that takes no args and performs the generation request.
                 It will be called repeatedly with fresh reCAPTCHA tokens on failure.
@@ -326,6 +358,19 @@ class FlowClient:
                         "reCAPTCHA failed (attempt %d/%d), retrying in %ds with fresh token...",
                         attempt + 1, max_retries, wait
                     )
+
+                    # On second attempt, also try refreshing cookies silently
+                    # (Google may have rotated session cookies, causing the
+                    # access token to be rejected alongside the reCAPTCHA token)
+                    if attempt >= 1:
+                        logger.info("Also attempting silent CDP cookie refresh...")
+                        refreshed = refresh_cookies_from_cdp()
+                        if refreshed and refreshed.is_valid:
+                            self.cookies = refreshed.cookies
+                            self._access_token = ""  # Force token refresh
+                            self._refresh_token()
+                            logger.info("Cookies silently refreshed during reCAPTCHA retry")
+
                     # Force reconnect to get a fresh reCAPTCHA token
                     if self._recaptcha:
                         self._recaptcha.close()
