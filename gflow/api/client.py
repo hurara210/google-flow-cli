@@ -143,11 +143,12 @@ class FlowClient:
         self._sandbox_session = requests.Session()
         self._labs_session = requests.Session()
 
-        # Apply proxy if available
+        # Apply proxy to sandbox session only (aisandbox-pa.googleapis.com).
+        # labs.google works fine without proxy — only the generation API
+        # blocks datacenter IPs.
         if self._proxies:
             proxy_url = self._pick_proxy()
             self._sandbox_session.proxies = {"https": proxy_url, "http": proxy_url}
-            self._labs_session.proxies = {"https": proxy_url, "http": proxy_url}
             if self.debug:
                 # Mask credentials in log
                 masked = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
@@ -165,12 +166,11 @@ class FlowClient:
         return proxy
 
     def _rotate_proxy(self) -> None:
-        """Switch both sessions to the next proxy in the list."""
+        """Switch sandbox session to the next proxy in the list."""
         if not self._proxies or len(self._proxies) < 2:
             return
         proxy_url = self._pick_proxy()
         self._sandbox_session.proxies = {"https": proxy_url, "http": proxy_url}
-        self._labs_session.proxies = {"https": proxy_url, "http": proxy_url}
         masked = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
         logger.info("Rotated to proxy: %s", masked)
 
@@ -319,26 +319,13 @@ class FlowClient:
         if self.debug:
             logger.info("Creating project: %s", json.dumps(payload))
 
-        # Retry with proxy rotation on connection errors
-        resp = None
-        for attempt in range(3):
-            try:
-                resp = self._labs_session.post(url, json=payload, timeout=30)
-                break
-            except (requests.exceptions.ConnectionError, requests.exceptions.ProxyError) as e:
-                if attempt < 2:
-                    logger.warning("Project creation connection failed (attempt %d/3): %s", attempt + 1, str(e)[:100])
-                    self._rotate_proxy()
-                    time.sleep(2)
-                else:
-                    raise
+        resp = self._labs_session.post(url, json=payload, timeout=30)
 
         # If cookies are stale, re-auth and retry once
         if resp.status_code == 401:
             logger.info("Project creation got 401 — re-authenticating...")
             if self._re_authenticate():
                 self._refresh_token()
-                self._rotate_proxy()  # Also try next proxy
                 resp = self._labs_session.post(url, json=payload, timeout=30)
 
         # If still 401, try via Chrome CDP (datacenter IPs get blocked on direct HTTP)
