@@ -319,13 +319,26 @@ class FlowClient:
         if self.debug:
             logger.info("Creating project: %s", json.dumps(payload))
 
-        resp = self._labs_session.post(url, json=payload, timeout=30)
+        # Retry with proxy rotation on connection errors
+        resp = None
+        for attempt in range(3):
+            try:
+                resp = self._labs_session.post(url, json=payload, timeout=30)
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.ProxyError) as e:
+                if attempt < 2:
+                    logger.warning("Project creation connection failed (attempt %d/3): %s", attempt + 1, str(e)[:100])
+                    self._rotate_proxy()
+                    time.sleep(2)
+                else:
+                    raise
 
         # If cookies are stale, re-auth and retry once
         if resp.status_code == 401:
             logger.info("Project creation got 401 — re-authenticating...")
             if self._re_authenticate():
                 self._refresh_token()
+                self._rotate_proxy()  # Also try next proxy
                 resp = self._labs_session.post(url, json=payload, timeout=30)
 
         # If still 401, try via Chrome CDP (datacenter IPs get blocked on direct HTTP)
