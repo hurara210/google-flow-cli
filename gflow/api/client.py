@@ -161,11 +161,12 @@ class FlowClient:
     3. Cookie auth for labs.google
     """
 
-    def __init__(self, cookies: str, *, debug: bool = False):
+    def __init__(self, cookies: str, *, debug: bool = False, project_id: str = ""):
         self.debug = debug or os.environ.get("GFLOW_DEBUG") == "true"
         self.cookies = cookies
         self._access_token: str = ""
-        self._project_id: str = ""
+        self._token_expires: float = 0  # Unix timestamp when token expires
+        self._project_id: str = project_id
         self._workflow_id: str = ""
         self._primary_media_id: str = ""  # from workflow metadata — used for extend
         self._session_id: str = f";{int(time.time() * 1000)}"
@@ -219,9 +220,71 @@ class FlowClient:
     # ------------------------------------------------------------------
 
     def _ensure_token(self) -> None:
-        """Ensure we have a valid access token."""
-        if not self._access_token:
+        """Ensure we have a valid, non-expired access token."""
+        if not self._access_token or self._is_token_expired():
+            if self._is_token_expired():
+                logger.info("Access token expired or expiring soon, refreshing proactively...")
             self._refresh_token()
+
+    def _is_token_expired(self, buffer_seconds: int = 60) -> bool:
+        """Check if the access token is expired or will expire within buffer_seconds.
+
+        Returns False if no expiry info is available (assume valid until 401).
+        """
+        if not self._token_expires:
+            return False
+        return time.time() >= (self._token_expires - buffer_seconds)
+
+    @staticmethod
+    def _parse_expires(expires_value) -> float:
+        """Parse an expires value from the session endpoint into a Unix timestamp.
+
+        Handles multiple formats:
+          - ISO 8601 string ("2026-05-05T16:00:00Z")
+          - Epoch seconds (int/float or numeric string)
+          - Seconds from now (small number)
+        Returns 0 if the value cannot be parsed.
+        """
+        if not expires_value:
+            return 0
+
+        # Numeric value (int or float)
+        if isinstance(expires_value, (int, float)):
+            if expires_value > 946684800:  # After year 2000 → epoch seconds
+                return float(expires_value)
+            return time.time() + expires_value  # Small number → seconds from now
+
+        s = str(expires_value).strip()
+
+        # Try ISO 8601 formats
+        try:
+            from datetime import datetime, timezone
+            for fmt in (
+                "%Y-%m-%dT%H:%M:%SZ",
+                "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S.%fZ",
+                "%Y-%m-%dT%H:%M:%S.%f%z",
+            ):
+                try:
+                    dt = datetime.strptime(s, fmt)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return dt.timestamp()
+                except ValueError:
+                    continue
+        except Exception:
+            pass
+
+        # Try as numeric string
+        try:
+            val = float(s)
+            if val > 946684800:
+                return val
+            return time.time() + val
+        except ValueError:
+            pass
+
+        return 0
 
     def _refresh_token(self) -> None:
         """Get a fresh access token from the session endpoint.
@@ -234,12 +297,20 @@ class FlowClient:
         3. Full browser re-authentication (last resort — requires user login)
         """
         # Tier 1: Try existing cookies
+        saved_err = None
         try:
             data = refresh_access_token(self.cookies, debug=self.debug)
+            expires = self._parse_expires(data.get("expires", ""))
+            if expires and time.time() >= (expires - 60):
+                # The session endpoint sometimes returns 200 OK but with an expired token
+                # when the cookies are stale. Treat this as an AuthError to trigger recovery.
+                raise AuthError(f"Server returned an expired token (expires: {data.get('expires')})")
+            
             self._apply_token(data)
             return
-        except AuthError as original_err:
-            logger.info("Tier 1 failed (existing cookies expired)")
+        except AuthError as e:
+            saved_err = e
+            logger.info("Tier 1 failed (existing cookies expired or returned expired token)")
 
         # Tier 2: Silent CDP cookie refresh — re-extract cookies from the
         # Chrome instance that's already running (Google rotates cookies
@@ -260,13 +331,20 @@ class FlowClient:
         logger.info("Falling back to full browser re-authentication...")
         new_cookies = self._re_authenticate()
         if not new_cookies:
-            raise original_err
+            if saved_err:
+                raise saved_err
+            raise AuthError("Authentication failed")
         data = refresh_access_token(self.cookies, debug=self.debug)
         self._apply_token(data)
 
     def _apply_token(self, data: dict) -> None:
         """Apply a fresh access token and update session headers."""
         self._access_token = data["access_token"]
+        self._token_expires = self._parse_expires(data.get("expires", ""))
+
+        if self.debug and self._token_expires:
+            remaining = self._token_expires - time.time()
+            logger.info("Token expires in %.0f seconds (%.1f minutes)", remaining, remaining / 60)
 
         # Update sandbox session (Bearer only, no cookies)
         self._sandbox_session.headers.update({
@@ -292,10 +370,13 @@ class FlowClient:
         try:
             from gflow.auth import BrowserAuth, save_env
             browser_auth = BrowserAuth(debug=self.debug)
-            auth = browser_auth.get_auth(interactive=True)
-            save_env(auth)
-            self.cookies = auth.cookies
-            return self.cookies
+            # Force browser login, bypassing get_auth's local disk check
+            auth = browser_auth._login_with_browser()
+            if auth and auth.is_valid:
+                save_env(auth)
+                self.cookies = auth.cookies
+                return self.cookies
+            return None
         except Exception as e:
             logger.warning("Auto re-authentication failed: %s", e)
             return None
@@ -1386,13 +1467,29 @@ class FlowClient:
     def _sandbox_request(self, method: str, url: str, json_payload: dict | None = None) -> requests.Response:
         """Make an authenticated request to aisandbox-pa.googleapis.com.
 
-        On proxy setups, falls back to Chrome CDP routing when direct HTTP
-        gets 401 (IP mismatch between Python requests and Chrome's proxy).
+        Primary path: Chrome CDP (ensures IP consistency with auth session).
+        Fallback: direct HTTP (used when CDP is unavailable).
         """
         import time as _time
 
         if self.debug:
             logger.info("%s %s", method, url)
+
+        # --- Primary: Chrome CDP ---
+        # Route through Chrome so auth, token, and API all share the same
+        # exit IP. Avoids 403 IP-block entirely instead of recovering from it.
+        cdp_result = self._request_via_cdp(method, url, json_payload)
+        if cdp_result is not None:
+            if self.debug:
+                logger.info("CDP sandbox request succeeded (primary path)")
+            fake_resp = requests.Response()
+            fake_resp.status_code = 200
+            fake_resp._content = json.dumps(cdp_result).encode("utf-8")
+            fake_resp.encoding = "utf-8"
+            return fake_resp
+
+        # --- Fallback: direct HTTP ---
+        logger.info("CDP unavailable — falling back to direct HTTP for %s %s", method, url)
 
         # aisandbox-pa uses text/plain;charset=UTF-8 with JSON body
         kwargs: dict[str, Any] = {"timeout": 120}
@@ -1410,8 +1507,9 @@ class FlowClient:
                     requests.exceptions.ProxyError) as e:
                 if attempt < max_retries - 1:
                     wait = 5 * (attempt + 1)
-                    logger.warning("Connection error on %s %s (attempt %d/%d), retrying in %ds: %s", method, url, attempt + 1, max_retries, wait, e)
-                    self._rotate_proxy()  # Try next proxy on connection failure
+                    logger.warning("Connection error on %s %s (attempt %d/%d), retrying in %ds: %s",
+                                   method, url, attempt + 1, max_retries, wait, e)
+                    self._rotate_proxy()
                     _time.sleep(wait)
                 else:
                     raise
@@ -1420,31 +1518,14 @@ class FlowClient:
             if self.debug:
                 logger.info("Got 401, refreshing token...")
             self._refresh_token()
-            # Also try rotating proxy on 401 — datacenter IPs get blocked
             if self._proxies:
                 self._rotate_proxy()
             resp = self._sandbox_session.request(method, url, **kwargs)
-
-        # If still 401 and we have a proxy setup, the issue is likely IP mismatch:
-        # Python requests exits through a different proxy IP than Chrome.
-        # Route through Chrome CDP instead (same IP as auth session).
-        if resp.status_code == 401 and self._proxies:
-            logger.info("Direct HTTP still 401 with proxies — trying via Chrome CDP (same IP as auth)...")
-            cdp_result = self._request_via_cdp(method, url, json_payload)
-            if cdp_result is not None:
-                logger.info("CDP sandbox request succeeded — proxy IP mismatch confirmed")
-                # Wrap in a fake Response so callers can use .json() / .status_code
-                fake_resp = requests.Response()
-                fake_resp.status_code = 200
-                fake_resp._content = json.dumps(cdp_result).encode("utf-8")
-                fake_resp.encoding = "utf-8"
-                return fake_resp
 
         if resp.status_code == 401:
             raise FlowAPIError("Auth expired. Run: gflow auth --clear\nthen: gflow auth")
         if resp.status_code == 403:
             resp_text = resp.text[:500]
-            # reCAPTCHA failures are retryable — score can vary between evaluations
             if "recaptcha" in resp_text.lower() or "reCAPTCHA" in resp_text:
                 raise FlowRecaptchaError(
                     f"Permission denied (403): {resp_text}"

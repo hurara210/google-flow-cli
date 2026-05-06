@@ -273,9 +273,20 @@ def _wait_for_cdp_page(port: int, timeout: int = 30) -> str:
 
 
 def _get_all_cookies_cdp(cdp: _CDPConnection) -> list[dict]:
-    """Get all cookies via CDP Network.getAllCookies."""
+    """Get all cookies via CDP Network.getAllCookies, filtered by relevant domains."""
     result = cdp.send("Network.getAllCookies")
-    return result.get("cookies", [])
+    all_cookies = result.get("cookies", [])
+    
+    # Filter only relevant domains to prevent HTTP 431 Request Header Fields Too Large
+    allowed_domains = ("google.com", "labs.google", "googleapis.com")
+    
+    filtered = []
+    for c in all_cookies:
+        domain = c.get("domain", "").lower()
+        if any(domain == d or domain.endswith("." + d) for d in allowed_domains):
+            filtered.append(c)
+            
+    return filtered
 
 
 def _get_current_url_cdp(cdp: _CDPConnection) -> str:
@@ -614,6 +625,18 @@ def kill_auth_browser() -> None:
             ws = websocket.create_connection(ws_url, timeout=5)
             ws.send(json.dumps({"id": 1, "method": "Browser.close"}))
             ws.close()
+    except Exception:
+        pass
+
+    # Aggressively kill any remaining Chrome processes using our profile
+    try:
+        import platform
+        import subprocess
+        if platform.system() == "Windows":
+            cmd = 'wmic process where "commandline like \'%chrome-profile%\' and commandline like \'%gflow%\'" call terminate'
+            subprocess.run(cmd, shell=True, capture_output=True)
+        else:
+            subprocess.run(["pkill", "-f", ".gflow/chrome-profile"], capture_output=True)
     except Exception:
         pass
 
